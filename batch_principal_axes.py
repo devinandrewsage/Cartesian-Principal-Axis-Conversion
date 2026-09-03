@@ -23,7 +23,7 @@ from principal_axes import (
     to_principal_axes, ATOMIC_MASSES,
     NEAR_DEGENERATE_THRESHOLD, SIGN_AMBIGUOUS_THRESHOLD,
 )
-from gaussian_reader import read_gaussian_com
+from gaussian_reader import read_gaussian_com, write_gaussian_com
 
 
 def write_run_metadata(out_dir, input_dir, n_jobs_requested, effective_n_jobs, n_files):
@@ -94,7 +94,7 @@ def write_xyz(path, symbols, coords, comment=""):
             f.write(f"{s} {x:.6f} {y:.6f} {z:.6f}\n")
 
 
-def process_one(path, out_dir):
+def process_one(path, out_dir, output_format="xyz"):
     name = os.path.splitext(os.path.basename(path))[0]
     wall_t0 = time.perf_counter()
     cpu_t0 = time.process_time()
@@ -107,8 +107,13 @@ def process_one(path, out_dir):
 
         new_coords, info = to_principal_axes(coords, masses)
 
-        out_path = os.path.join(out_dir, f"{name}_principal.xyz")
-        write_xyz(out_path, symbols, new_coords, comment=f"principal-axis frame of {name}")
+        if output_format == "com":
+            out_path = os.path.join(out_dir, f"{name}_principal.com")
+            write_gaussian_com(out_path, symbols, new_coords,
+                                title=f"principal-axis frame of {name}")
+        else:
+            out_path = os.path.join(out_dir, f"{name}_principal.xyz")
+            write_xyz(out_path, symbols, new_coords, comment=f"principal-axis frame of {name}")
 
         moments = info["principal_moments"]
         near_degenerate = False
@@ -146,7 +151,92 @@ def estimate_parallel_overhead(n_jobs):
     return time.perf_counter() - t0
 
 
-def run_batch(input_dir, out_dir, n_jobs=-1, pattern="*", auto_parallel=True):
+def generate_summary_report(df, metadata, out_dir):
+    """
+    Generate a shareable markdown summary report with an embedded chart --
+    a professional, human-readable lab record, not just a raw CSV.
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    ok_df = df[df["status"] == "ok"]
+    n_ok = len(ok_df)
+    n_total = len(df)
+
+    chart_path = os.path.join(out_dir, "summary_chart.png")
+    if n_ok > 0:
+        fig, axes = plt.subplots(1, 2, figsize=(10, 4))
+
+        counts = [
+            ok_df["near_degenerate_moments"].sum(),
+            ok_df["reflection_corrected"].sum(),
+            ok_df["sign_ambiguous"].sum(),
+        ]
+        labels = ["Near-degenerate\nmoments", "Reflection\ncorrected", "Sign\nambiguous"]
+        axes[0].bar(labels, counts, color=["#4C72B0", "#55A868", "#C44E52"])
+        axes[0].set_ylabel("Count")
+        axes[0].set_title(f"QC flags ({n_ok} structures)")
+
+        axes[1].hist(ok_df["n_atoms"], bins=min(20, n_ok), color="#4C72B0", edgecolor="white")
+        axes[1].set_xlabel("Atoms per structure")
+        axes[1].set_ylabel("Count")
+        axes[1].set_title("Structure size distribution")
+
+        plt.tight_layout()
+        plt.savefig(chart_path, dpi=120)
+        plt.close(fig)
+
+    report_lines = [
+        "# Batch Run Summary Report",
+        "",
+        f"**Run timestamp:** {metadata['timestamp']}",
+        f"**Input directory:** `{metadata['input_dir']}`",
+        f"**Structures found:** {metadata['n_files']}",
+        f"**Succeeded:** {n_ok} / {n_total}",
+        "",
+        "## Environment",
+        f"- Python {metadata['environment']['python_version'].split()[0]}",
+        f"- numpy {metadata['environment']['numpy_version']}, "
+        f"scipy {metadata['environment']['scipy_version']}, "
+        f"pandas {metadata['environment']['pandas_version']}, "
+        f"joblib {metadata['environment']['joblib_version']}",
+        f"- Platform: {metadata['environment']['platform']}",
+        "",
+        "## Analysis conventions used",
+        f"- Near-degenerate threshold: {metadata['conventions']['near_degenerate_threshold']} "
+        f"({metadata['conventions']['near_degenerate_description']})",
+        f"- Sign-ambiguous threshold: {metadata['conventions']['sign_ambiguous_threshold']} "
+        f"({metadata['conventions']['sign_ambiguous_description']})",
+        f"- Sign convention: {metadata['conventions']['sign_convention_rule']}",
+        f"- Reflection rule: {metadata['conventions']['reflection_rule']}",
+        "",
+    ]
+
+    if n_ok > 0:
+        report_lines += [
+            "## QC summary",
+            f"- Near-degenerate moments flagged: {ok_df['near_degenerate_moments'].sum()} of {n_ok}",
+            f"- Reflection corrections applied: {ok_df['reflection_corrected'].sum()} of {n_ok}",
+            f"- Sign-ambiguous (unstable) cases: {ok_df['sign_ambiguous'].sum()} of {n_ok}",
+            "",
+            "![QC summary chart](summary_chart.png)",
+            "",
+        ]
+
+    if n_total - n_ok > 0:
+        report_lines += ["## Failures", ""]
+        for _, row in df[df["status"] != "ok"].iterrows():
+            report_lines.append(f"- `{row['name']}`: {row['status']}")
+        report_lines.append("")
+
+    report_path = os.path.join(out_dir, "summary_report.md")
+    with open(report_path, "w") as f:
+        f.write("\n".join(report_lines))
+    return report_path
+
+
+def run_batch(input_dir, out_dir, n_jobs=-1, pattern="*", auto_parallel=True, output_format="xyz"):
     os.makedirs(out_dir, exist_ok=True)
     files = sorted(
         glob.glob(os.path.join(input_dir, f"{pattern}.xyz")) +
@@ -165,7 +255,7 @@ def run_batch(input_dir, out_dir, n_jobs=-1, pattern="*", auto_parallel=True):
         sample_size = min(5, len(files))
         sample_t0 = time.perf_counter()
         for f in files[:sample_size]:
-            process_one(f, out_dir)
+            process_one(f, out_dir, output_format)
         sample_time = time.perf_counter() - sample_t0
         avg_per_structure = sample_time / sample_size
         est_serial_total = avg_per_structure * len(files)
@@ -187,16 +277,18 @@ def run_batch(input_dir, out_dir, n_jobs=-1, pattern="*", auto_parallel=True):
     print(f"\nRunning with n_jobs={effective_n_jobs}...")
     batch_wall_t0 = time.perf_counter()
     results = Parallel(n_jobs=effective_n_jobs, verbose=5)(
-        delayed(process_one)(f, out_dir) for f in files
+        delayed(process_one)(f, out_dir, output_format) for f in files
     )
     batch_wall_time = time.perf_counter() - batch_wall_t0
 
     df = pd.DataFrame(results)
     df.to_csv(os.path.join(out_dir, "batch_report.csv"), index=False)
 
-    write_run_metadata(out_dir, input_dir, n_jobs, effective_n_jobs, len(files))
+    metadata = write_run_metadata(out_dir, input_dir, n_jobs, effective_n_jobs, len(files))
+    report_path = generate_summary_report(df, metadata, out_dir)
     print(f"\nEnvironment/convention metadata written to "
           f"{os.path.join(out_dir, 'run_metadata.json')}")
+    print(f"Summary report written to {report_path}")
 
     n_ok = (df["status"] == "ok").sum()
     n_err = len(df) - n_ok
@@ -235,5 +327,8 @@ if __name__ == "__main__":
     p.add_argument("--n_jobs", type=int, default=-1)
     p.add_argument("--no-auto", action="store_true",
                     help="Skip the serial-vs-parallel calibration check and always use --n_jobs as given.")
+    p.add_argument("--output-format", choices=["xyz", "com"], default="xyz",
+                    help="Write output structures as plain .xyz (default) or Gaussian .com input files.")
     args = p.parse_args()
-    run_batch(args.input_dir, args.out_dir, args.n_jobs, auto_parallel=not args.no_auto)
+    run_batch(args.input_dir, args.out_dir, args.n_jobs,
+              auto_parallel=not args.no_auto, output_format=args.output_format)
