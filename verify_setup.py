@@ -3,7 +3,7 @@ verify_setup.py
 
 Consolidated regression test. Run this any time after changing the code
 or setting up a new environment, BEFORE trusting output from a real batch
-run.
+run. Bundles every check we've validated by hand into one script.
 """
 
 import numpy as np
@@ -64,10 +64,51 @@ def check_invariance(path, label):
     return passed and bond_ok
 
 
+def check_round_trip():
+    from batch_principal_axes import write_xyz, read_xyz
+    import tempfile, os as os_module
+
+    symbols = ["C", "O", "H", "H"]
+    coords = np.array([
+        [0.123456, -1.987654, 0.0],
+        [1.5, 2.5, -3.5],
+        [-0.999999, 0.0001, 5.5],
+        [10.0, -10.0, 0.0],
+    ])
+    with tempfile.TemporaryDirectory() as tmpdir:
+        path = os_module.path.join(tmpdir, "test.xyz")
+        write_xyz(path, symbols, coords, comment="round-trip test")
+        symbols_read, coords_read = read_xyz(path)
+
+    symbols_ok = symbols == symbols_read
+    diff = np.abs(coords - coords_read).max()
+    coords_ok = diff < 1e-5
+    passed = symbols_ok and coords_ok
+    print(f"[{'PASS' if passed else 'FAIL'}] Round-trip write/read: "
+          f"symbols_match={symbols_ok}, max_coord_diff={diff:.2e}")
+    return passed
+
+
+def check_input_validation():
+    cases = [
+        ("NaN coordinate", np.array([[0, 0, 0], [1, np.nan, 0]]), np.array([12., 1.])),
+        ("Zero total mass", np.array([[0, 0, 0], [1, 0, 0]]), np.array([0., 0.])),
+        ("Empty structure", np.array([]).reshape(0, 3), np.array([])),
+        ("Mismatched atom count", np.array([[0, 0, 0], [1, 0, 0]]), np.array([12.])),
+        ("Negative mass", np.array([[0, 0, 0], [1, 0, 0]]), np.array([12., -1.])),
+    ]
+    all_ok = True
+    for label, coords, masses in cases:
+        try:
+            to_principal_axes(coords, masses)
+            print(f"[FAIL] {label}: expected ValueError, none raised")
+            all_ok = False
+        except ValueError:
+            print(f"[PASS] {label}: raised ValueError as expected")
+    return all_ok
+
+
 def check_sign_ambiguity_detection():
-    """Confirms the sign_ambiguous flag correctly identifies known-unstable
-    cases (formaldehyde, CO2) and does NOT false-positive on a known-stable
-    asymmetric case (formic acid)."""
     cases = [
         (["C", "O", "H", "H"], np.array([
             [0, 0, 0], [0, -1.208, 0], [0.9495, 0.5865, 0], [-0.9495, 0.5865, 0]
@@ -110,7 +151,9 @@ if __name__ == "__main__":
     else:
         print("[SKIPPED] Real peptide test data not found at", peptide_dir)
 
-    check_sign_ambiguity_detection()
+    results.append(check_sign_ambiguity_detection())
+    results.append(check_round_trip())
+    results.append(check_input_validation())
 
     print("=" * 70)
     if all(results):

@@ -9,12 +9,60 @@ files and Gaussian .com/.gjf input files.
 import os
 import glob
 import time
+import sys
+import platform
+import json
+from datetime import datetime
 import numpy as np
 import pandas as pd
+import scipy
+import joblib as joblib_module
 from joblib import Parallel, delayed
 
-from principal_axes import to_principal_axes, ATOMIC_MASSES
+from principal_axes import (
+    to_principal_axes, ATOMIC_MASSES,
+    NEAR_DEGENERATE_THRESHOLD, SIGN_AMBIGUOUS_THRESHOLD,
+)
 from gaussian_reader import read_gaussian_com
+
+
+def write_run_metadata(out_dir, input_dir, n_jobs_requested, effective_n_jobs, n_files):
+    metadata = {
+        "timestamp": datetime.now().isoformat(),
+        "input_dir": os.path.abspath(input_dir),
+        "output_dir": os.path.abspath(out_dir),
+        "n_files": n_files,
+        "n_jobs_requested": n_jobs_requested,
+        "n_jobs_used": effective_n_jobs,
+        "environment": {
+            "python_version": sys.version,
+            "platform": platform.platform(),
+            "numpy_version": np.__version__,
+            "scipy_version": scipy.__version__,
+            "pandas_version": pd.__version__,
+            "joblib_version": joblib_module.__version__,
+        },
+        "conventions": {
+            "near_degenerate_threshold": NEAR_DEGENERATE_THRESHOLD,
+            "near_degenerate_description":
+                "Two principal moments flagged if within this fraction of each other.",
+            "sign_ambiguous_threshold": SIGN_AMBIGUOUS_THRESHOLD,
+            "sign_ambiguous_description":
+                "Flagged when the top-2 largest-projection atoms on any axis "
+                "are within this relative tolerance -- the sign convention "
+                "becomes numerically unstable under rotation in this case.",
+            "sign_convention_rule":
+                "For each principal axis, the atom with largest |projection| "
+                "is forced positive.",
+            "reflection_rule":
+                "If the resulting rotation matrix has det(V) < 0 (a "
+                "reflection, not a proper rotation), axis 2 is flipped to "
+                "restore det(V) = +1 and preserve molecular chirality.",
+        },
+    }
+    with open(os.path.join(out_dir, "run_metadata.json"), "w") as f:
+        json.dump(metadata, f, indent=2)
+    return metadata
 
 
 def read_xyz(path):
@@ -66,7 +114,7 @@ def process_one(path, out_dir):
         near_degenerate = False
         for i in range(3):
             for j in range(i + 1, 3):
-                if moments[j] > 0 and abs(moments[i] - moments[j]) / moments[j] < 0.02:
+                if moments[j] > 0 and abs(moments[i] - moments[j]) / moments[j] < NEAR_DEGENERATE_THRESHOLD:
                     near_degenerate = True
 
         wall_time = time.perf_counter() - wall_t0
@@ -145,6 +193,10 @@ def run_batch(input_dir, out_dir, n_jobs=-1, pattern="*", auto_parallel=True):
 
     df = pd.DataFrame(results)
     df.to_csv(os.path.join(out_dir, "batch_report.csv"), index=False)
+
+    write_run_metadata(out_dir, input_dir, n_jobs, effective_n_jobs, len(files))
+    print(f"\nEnvironment/convention metadata written to "
+          f"{os.path.join(out_dir, 'run_metadata.json')}")
 
     n_ok = (df["status"] == "ok").sum()
     n_err = len(df) - n_ok

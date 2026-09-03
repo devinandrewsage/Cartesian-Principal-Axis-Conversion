@@ -20,6 +20,9 @@ ATOMIC_MASSES = {
     "Br": 79.904, "I": 126.904,
 }
 
+NEAR_DEGENERATE_THRESHOLD = 0.02   # moments within 2% of each other
+SIGN_AMBIGUOUS_THRESHOLD = 1e-3    # top-2 projections within 0.1% of each other
+
 
 def center_of_mass(coords: np.ndarray, masses: np.ndarray) -> np.ndarray:
     return (coords * masses[:, None]).sum(axis=0) / masses.sum()
@@ -48,12 +51,8 @@ def fix_rotation_convention(V: np.ndarray, coords: np.ndarray):
     for k in range(3):
         abs_proj = np.abs(projections[:, k])
         sorted_proj = np.sort(abs_proj)[::-1]
-        # Flag when the top two atoms are within 0.1% of each other in
-        # magnitude -- this is the exact mechanism that broke formaldehyde
-        # and CO2: the sign convention's choice becomes essentially a coin
-        # flip decided by floating-point rounding under rotation.
         if len(sorted_proj) >= 2 and sorted_proj[0] > 0:
-            if (sorted_proj[0] - sorted_proj[1]) / sorted_proj[0] < 1e-3:
+            if (sorted_proj[0] - sorted_proj[1]) / sorted_proj[0] < SIGN_AMBIGUOUS_THRESHOLD:
                 sign_ambiguous = True
 
         idx = np.argmax(abs_proj)
@@ -66,7 +65,52 @@ def fix_rotation_convention(V: np.ndarray, coords: np.ndarray):
     return V, reflection_corrected, sign_ambiguous
 
 
+def validate_input(coords: np.ndarray, masses: np.ndarray):
+    """
+    Check for common real-data problems before doing any computation, and
+    raise a clear, specific error rather than letting a cryptic failure
+    happen several function calls deep inside the linear algebra.
+    """
+    coords = np.asarray(coords, dtype=float)
+    masses = np.asarray(masses, dtype=float)
+
+    if coords.shape[0] == 0:
+        raise ValueError("Structure has 0 atoms -- cannot compute an orientation.")
+
+    if coords.shape[0] != masses.shape[0]:
+        raise ValueError(
+            f"Mismatched atom count: {coords.shape[0]} coordinate rows but "
+            f"{masses.shape[0]} masses."
+        )
+
+    if coords.shape[1] != 3:
+        raise ValueError(f"Expected coordinates with shape (N, 3), got {coords.shape}.")
+
+    nan_rows = np.where(np.isnan(coords).any(axis=1))[0]
+    if len(nan_rows) > 0:
+        raise ValueError(f"NaN coordinate(s) found at atom index(es): {list(nan_rows)}.")
+
+    inf_rows = np.where(np.isinf(coords).any(axis=1))[0]
+    if len(inf_rows) > 0:
+        raise ValueError(f"Infinite coordinate(s) found at atom index(es): {list(inf_rows)}.")
+
+    if np.any(masses <= 0):
+        bad_idx = np.where(masses <= 0)[0]
+        raise ValueError(
+            f"Non-positive mass(es) found at atom index(es): {list(bad_idx)}. "
+            f"All atomic masses must be > 0."
+        )
+
+    if coords.shape[0] == 1:
+        import warnings
+        warnings.warn(
+            "Structure has only 1 atom -- orientation is undefined (all "
+            "moments of inertia are zero); returning the atom at the origin."
+        )
+
+
 def to_principal_axes(coords: np.ndarray, masses: np.ndarray):
+    validate_input(coords, masses)
     coords = np.asarray(coords, dtype=float)
     masses = np.asarray(masses, dtype=float)
 
