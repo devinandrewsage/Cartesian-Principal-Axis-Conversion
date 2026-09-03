@@ -1,0 +1,5 @@
+GAMA-peptide/
+*_output/
+bench_xyz/
+__pycache__/
+*.pyc
