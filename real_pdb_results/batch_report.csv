@@ -1,0 +1,2 @@
+name,status,n_atoms,com_x,com_y,com_z,I1,I2,I3,near_degenerate_moments,reflection_corrected,sign_ambiguous,bbox_area_before,bbox_area_after,wall_time_sec,cpu_time_sec,output_path
+1UBQ,ok,660,30.303646884101465,28.722268344038905,15.058981406801426,667050.0300814733,928588.4757276927,1020687.3520728055,False,False,False,1042.18759,1323.0524713218617,0.009649546000218834,0.05275578000000003,real_pdb_results/1UBQ_principal.xyz

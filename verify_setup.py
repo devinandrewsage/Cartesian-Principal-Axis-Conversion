@@ -7,6 +7,7 @@ run. Bundles every check we've validated by hand into one script.
 """
 
 import numpy as np
+import os
 from principal_axes import to_principal_axes, ATOMIC_MASSES
 from batch_principal_axes import read_structure
 
@@ -133,6 +134,43 @@ def check_sign_ambiguity_detection():
     return all_ok
 
 
+def check_ase_cross_validation():
+    """Cross-validates our moment-of-inertia calculation against ASE's
+    independent implementation -- a genuine third-party correctness check,
+    not just internal self-consistency."""
+    try:
+        from ase import Atoms
+    except ImportError:
+        print("[SKIPPED] ASE not installed -- run `pip install ase` for cross-validation")
+        return True
+
+    cases = ["alpha_helix_ala_18.com", "Segglu_gama.com", "Gly12.com"]
+    all_ok = True
+    any_found = False
+    for name in cases:
+        path = os.path.join("GAMA-peptide", name)
+        if not os.path.exists(path):
+            continue
+        any_found = True
+        symbols, coords = read_structure(path)
+        masses = np.array([ATOMIC_MASSES[s] for s in symbols])
+        _, info = to_principal_axes(coords, masses)
+        our_moments = np.sort(info["principal_moments"])
+
+        atoms = Atoms(symbols=symbols, positions=coords)
+        ase_moments = np.sort(atoms.get_moments_of_inertia())
+
+        rel_diff = np.abs(our_moments - ase_moments) / np.abs(ase_moments)
+        ok = np.all(rel_diff < 1e-6)
+        all_ok &= ok
+        print(f"[{'PASS' if ok else 'FAIL'}] ASE cross-validation ({name}): "
+              f"max relative diff = {rel_diff.max():.2e}")
+
+    if not any_found:
+        print("[SKIPPED] ASE cross-validation: no real peptide test data found")
+    return all_ok
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("VERIFICATION SUITE")
@@ -141,7 +179,6 @@ if __name__ == "__main__":
     results = []
     results.append(check_water_reference())
 
-    import os
     peptide_dir = "GAMA-peptide"
     if os.path.isdir(peptide_dir):
         results.append(check_invariance(
@@ -154,6 +191,7 @@ if __name__ == "__main__":
     results.append(check_sign_ambiguity_detection())
     results.append(check_round_trip())
     results.append(check_input_validation())
+    results.append(check_ase_cross_validation())
 
     print("=" * 70)
     if all(results):

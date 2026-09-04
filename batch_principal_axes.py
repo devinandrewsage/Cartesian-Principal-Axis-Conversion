@@ -2,8 +2,8 @@
 batch_principal_axes.py
 
 Run the Cartesian -> principal-axis conversion across many structures in
-parallel, and collect QC metadata for the whole run. Supports plain .xyz
-files and Gaussian .com/.gjf input files.
+parallel, and collect QC metadata for the whole run. Supports plain .xyz,
+Gaussian .com/.gjf, and PDB input files.
 """
 
 import os
@@ -18,12 +18,14 @@ import pandas as pd
 import scipy
 import joblib as joblib_module
 from joblib import Parallel, delayed
+from tqdm import tqdm
 
 from principal_axes import (
     to_principal_axes, ATOMIC_MASSES,
     NEAR_DEGENERATE_THRESHOLD, SIGN_AMBIGUOUS_THRESHOLD,
 )
 from gaussian_reader import read_gaussian_com, write_gaussian_com
+from pdb_reader import read_pdb, write_pdb
 
 
 def write_run_metadata(out_dir, input_dir, n_jobs_requested, effective_n_jobs, n_files):
@@ -83,6 +85,16 @@ def read_structure(path):
         return read_xyz(path)
     elif ext in (".com", ".gjf"):
         return read_gaussian_com(path)
+    elif ext == ".pdb":
+        symbols, coords, n_ambiguous = read_pdb(path)
+        if n_ambiguous > 0:
+            import warnings
+            warnings.warn(
+                f"{path}: {n_ambiguous} atom(s) had no explicit element "
+                f"column and used the name-based fallback heuristic -- "
+                f"review these if the file is from an unusual source."
+            )
+        return symbols, coords
     else:
         raise ValueError(f"Unsupported file extension: {ext}")
 
@@ -94,7 +106,7 @@ def write_xyz(path, symbols, coords, comment=""):
             f.write(f"{s} {x:.6f} {y:.6f} {z:.6f}\n")
 
 
-def process_one(path, out_dir, output_format="xyz"):
+def process_one(path, out_dir, output_format="xyz", consolidated=False):
     name = os.path.splitext(os.path.basename(path))[0]
     wall_t0 = time.perf_counter()
     cpu_t0 = time.process_time()
@@ -107,13 +119,18 @@ def process_one(path, out_dir, output_format="xyz"):
 
         new_coords, info = to_principal_axes(coords, masses)
 
-        if output_format == "com":
-            out_path = os.path.join(out_dir, f"{name}_principal.com")
-            write_gaussian_com(out_path, symbols, new_coords,
-                                title=f"principal-axis frame of {name}")
-        else:
-            out_path = os.path.join(out_dir, f"{name}_principal.xyz")
-            write_xyz(out_path, symbols, new_coords, comment=f"principal-axis frame of {name}")
+        out_path = None
+        if not consolidated:
+            if output_format == "com":
+                out_path = os.path.join(out_dir, f"{name}_principal.com")
+                write_gaussian_com(out_path, symbols, new_coords,
+                                    title=f"principal-axis frame of {name}")
+            elif output_format == "pdb":
+                out_path = os.path.join(out_dir, f"{name}_principal.pdb")
+                write_pdb(out_path, symbols, new_coords)
+            else:
+                out_path = os.path.join(out_dir, f"{name}_principal.xyz")
+                write_xyz(out_path, symbols, new_coords, comment=f"principal-axis frame of {name}")
 
         moments = info["principal_moments"]
         near_degenerate = False
@@ -125,7 +142,7 @@ def process_one(path, out_dir, output_format="xyz"):
         wall_time = time.perf_counter() - wall_t0
         cpu_time = time.process_time() - cpu_t0
 
-        return {
+        result = {
             "name": name,
             "status": "ok",
             "n_atoms": len(symbols),
@@ -140,8 +157,32 @@ def process_one(path, out_dir, output_format="xyz"):
             "cpu_time_sec": cpu_time,
             "output_path": out_path,
         }
+        if consolidated:
+            result["_symbols"] = symbols
+            result["_coords"] = new_coords
+        return result
     except Exception as e:
         return {"name": name, "status": f"error: {e}"}
+
+
+def write_consolidated_hdf5(results, out_dir):
+    import h5py
+    path = os.path.join(out_dir, "structures.h5")
+    with h5py.File(path, "w") as f:
+        for r in results:
+            if r.get("status") != "ok" or "_symbols" not in r:
+                continue
+            grp = f.create_group(r["name"])
+            grp.create_dataset("symbols", data=np.array(r["_symbols"], dtype="S4"))
+            grp.create_dataset("coords", data=r["_coords"])
+            grp.attrs["n_atoms"] = r["n_atoms"]
+    return path
+
+
+def load_config(config_path):
+    import yaml
+    with open(config_path) as f:
+        return yaml.safe_load(f) or {}
 
 
 def estimate_parallel_overhead(n_jobs):
@@ -152,10 +193,6 @@ def estimate_parallel_overhead(n_jobs):
 
 
 def generate_summary_report(df, metadata, out_dir):
-    """
-    Generate a shareable markdown summary report with an embedded chart --
-    a professional, human-readable lab record, not just a raw CSV.
-    """
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -236,17 +273,42 @@ def generate_summary_report(df, metadata, out_dir):
     return report_path
 
 
-def run_batch(input_dir, out_dir, n_jobs=-1, pattern="*", auto_parallel=True, output_format="xyz"):
+class TqdmParallel(Parallel):
+    """
+    joblib.Parallel subclass that drives a tqdm progress bar correctly
+    under process-based parallelism. A naive approach (updating a tqdm
+    object from inside each worker task) fails, because the pbar object
+    can't be pickled and sent across process boundaries. This instead
+    hooks print_progress(), which joblib itself calls in the PARENT
+    process as tasks complete, regardless of backend.
+    """
+    def __init__(self, total, desc="Converting structures", *args, **kwargs):
+        self._tqdm_total = total
+        self._tqdm_desc = desc
+        super().__init__(*args, **kwargs)
+
+    def __call__(self, *args, **kwargs):
+        with tqdm(total=self._tqdm_total, desc=self._tqdm_desc, unit="structure") as self._pbar:
+            return super().__call__(*args, **kwargs)
+
+    def print_progress(self):
+        self._pbar.n = self.n_completed_tasks
+        self._pbar.refresh()
+
+
+def run_batch(input_dir, out_dir, n_jobs=-1, pattern="*", auto_parallel=True,
+              output_format="xyz", consolidated=False):
     os.makedirs(out_dir, exist_ok=True)
     files = sorted(
         glob.glob(os.path.join(input_dir, f"{pattern}.xyz")) +
         glob.glob(os.path.join(input_dir, f"{pattern}.com")) +
-        glob.glob(os.path.join(input_dir, f"{pattern}.gjf"))
+        glob.glob(os.path.join(input_dir, f"{pattern}.gjf")) +
+        glob.glob(os.path.join(input_dir, f"{pattern}.pdb"))
     )
     print(f"Found {len(files)} structures.")
 
     if len(files) == 0:
-        print(f"No .xyz/.com/.gjf files found in '{input_dir}'. "
+        print(f"No .xyz/.com/.gjf/.pdb files found in '{input_dir}'. "
               f"Check the path is correct and contains structure files.")
         return pd.DataFrame(columns=["name", "status"])
 
@@ -255,7 +317,7 @@ def run_batch(input_dir, out_dir, n_jobs=-1, pattern="*", auto_parallel=True, ou
         sample_size = min(5, len(files))
         sample_t0 = time.perf_counter()
         for f in files[:sample_size]:
-            process_one(f, out_dir, output_format)
+            process_one(f, out_dir, output_format, consolidated)
         sample_time = time.perf_counter() - sample_t0
         avg_per_structure = sample_time / sample_size
         est_serial_total = avg_per_structure * len(files)
@@ -276,17 +338,22 @@ def run_batch(input_dir, out_dir, n_jobs=-1, pattern="*", auto_parallel=True, ou
 
     print(f"\nRunning with n_jobs={effective_n_jobs}...")
     batch_wall_t0 = time.perf_counter()
-    results = Parallel(n_jobs=effective_n_jobs, verbose=5)(
-        delayed(process_one)(f, out_dir, output_format) for f in files
+
+    results = TqdmParallel(total=len(files), n_jobs=effective_n_jobs)(
+        delayed(process_one)(f, out_dir, output_format, consolidated) for f in files
     )
     batch_wall_time = time.perf_counter() - batch_wall_t0
 
-    df = pd.DataFrame(results)
+    df = pd.DataFrame([{k: v for k, v in r.items() if not k.startswith("_")} for r in results])
     df.to_csv(os.path.join(out_dir, "batch_report.csv"), index=False)
+
+    if consolidated:
+        h5_path = write_consolidated_hdf5(results, out_dir)
+        print(f"\nConsolidated structures written to {h5_path}")
 
     metadata = write_run_metadata(out_dir, input_dir, n_jobs, effective_n_jobs, len(files))
     report_path = generate_summary_report(df, metadata, out_dir)
-    print(f"\nEnvironment/convention metadata written to "
+    print(f"Environment/convention metadata written to "
           f"{os.path.join(out_dir, 'run_metadata.json')}")
     print(f"Summary report written to {report_path}")
 
@@ -319,16 +386,39 @@ def run_batch(input_dir, out_dir, n_jobs=-1, pattern="*", auto_parallel=True, ou
     return df
 
 
-if __name__ == "__main__":
+def main_cli():
     import argparse
     p = argparse.ArgumentParser()
-    p.add_argument("input_dir")
-    p.add_argument("out_dir")
-    p.add_argument("--n_jobs", type=int, default=-1)
+    p.add_argument("input_dir", nargs="?", default=None)
+    p.add_argument("out_dir", nargs="?", default=None)
+    p.add_argument("--n_jobs", type=int, default=None)
     p.add_argument("--no-auto", action="store_true",
                     help="Skip the serial-vs-parallel calibration check and always use --n_jobs as given.")
-    p.add_argument("--output-format", choices=["xyz", "com"], default="xyz",
-                    help="Write output structures as plain .xyz (default) or Gaussian .com input files.")
+    p.add_argument("--output-format", choices=["xyz", "com", "pdb"], default=None,
+                    help="Write output structures as .xyz (default), Gaussian .com, or .pdb files.")
+    p.add_argument("--consolidated", action="store_true",
+                    help="Write all results into a single structures.h5 file instead of one file per structure.")
+    p.add_argument("--config", default=None,
+                    help="YAML config file. CLI arguments override config file values.")
     args = p.parse_args()
-    run_batch(args.input_dir, args.out_dir, args.n_jobs,
-              auto_parallel=not args.no_auto, output_format=args.output_format)
+
+    settings = {}
+    if args.config:
+        settings = load_config(args.config)
+
+    input_dir = args.input_dir or settings.get("input_dir")
+    out_dir = args.out_dir or settings.get("out_dir")
+    if not input_dir or not out_dir:
+        p.error("input_dir and out_dir must be given on the command line or in --config.")
+
+    n_jobs = args.n_jobs if args.n_jobs is not None else settings.get("n_jobs", -1)
+    output_format = args.output_format or settings.get("output_format", "xyz")
+    auto_parallel = not args.no_auto and settings.get("auto_parallel", True)
+    consolidated = args.consolidated or settings.get("consolidated", False)
+
+    run_batch(input_dir, out_dir, n_jobs, auto_parallel=auto_parallel,
+              output_format=output_format, consolidated=consolidated)
+
+
+if __name__ == "__main__":
+    main_cli()

@@ -1,0 +1,24 @@
+{
+  "timestamp": "2026-09-03T20:01:13.176999",
+  "input_dir": "/home/devin/principle_conversion_project/test_molecules",
+  "output_dir": "/home/devin/principle_conversion_project/test_suite_results",
+  "n_files": 50,
+  "n_jobs_requested": -1,
+  "n_jobs_used": 1,
+  "environment": {
+    "python_version": "3.11.16 (main, Aug 27 2026, 14:44:21) [GCC 14.3.0]",
+    "platform": "Linux-6.6.87.2-microsoft-standard-WSL2-x86_64-with-glibc2.43",
+    "numpy_version": "2.4.6",
+    "scipy_version": "1.17.1",
+    "pandas_version": "3.0.5",
+    "joblib_version": "1.5.3"
+  },
+  "conventions": {
+    "near_degenerate_threshold": 0.02,
+    "near_degenerate_description": "Two principal moments flagged if within this fraction of each other.",
+    "sign_ambiguous_threshold": 0.001,
+    "sign_ambiguous_description": "Flagged when the top-2 largest-projection atoms on any axis are within this relative tolerance -- the sign convention becomes numerically unstable under rotation in this case.",
+    "sign_convention_rule": "For each principal axis, the atom with largest |projection| is forced positive.",
+    "reflection_rule": "If the resulting rotation matrix has det(V) < 0 (a reflection, not a proper rotation), axis 2 is flipped to restore det(V) = +1 and preserve molecular chirality."
+  }
+}

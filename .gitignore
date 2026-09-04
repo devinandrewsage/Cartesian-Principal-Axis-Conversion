@@ -1,5 +1,10 @@
 GAMA-peptide/
 *_output/
 bench_xyz/
+real_pdb_structures/
 __pycache__/
 *.pyc
+venv/
+*.egg-info/
+build/
+dist/
