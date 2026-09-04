@@ -1,16 +1,17 @@
 # Principal-Axis Conversion Pipeline
 
-Converts molecular Cartesian coordinates into a canonical, mass-weighted
+Converts molecular Cartesian coordinates into a mass-weighted
 principal-axis frame: center of mass at the origin, axes aligned to the
 eigenvectors of the moment-of-inertia tensor, with sign and chirality
-conventions enforced. This produces coordinates that are **invariant to
+conventions enforced. 
+
+This produces coordinates that are **invariant to
 the arbitrary translation/rotation of the input file** — two
 representations of the same physical structure, however differently
 oriented, converge to identical output.
 
 This is a preprocessing step intended to feed into orientation-dependent
-downstream analysis (e.g. grid-based fragmentation schemes such as
-GAMA2, Kundu & Saha, *J. Phys. Chem. Lett.* 2026), where the answer to
+downstream analysis where the answer to
 "which atoms fall in this spatial region" must not depend on how a
 structure happened to be written to a file.
 
